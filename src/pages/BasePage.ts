@@ -1,11 +1,16 @@
 import { expect, Locator, Page } from '@playwright/test';
+import { retry } from '../utils/retry';
 import { waitForLoaders } from '../utils/waits';
 
 export abstract class BasePage {
-  constructor(protected readonly page: Page) {}
+  constructor(protected readonly page: Page) { }
 
   protected async open(path: string): Promise<void> {
-    await this.page.goto(path, { waitUntil: 'domcontentloaded' });
+    // Navigation is idempotent, so retrying it is safe and absorbs slow/throttled responses.
+    await retry(
+      () => this.page.goto(path, { waitUntil: 'domcontentloaded', timeout: 45_000 }),
+      { attempts: 3, delayMs: 2_000, label: `goto ${path}` },
+    );
     await this.waitForLoaders();
   }
 
