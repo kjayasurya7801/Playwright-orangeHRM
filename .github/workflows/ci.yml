@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 2 * * *'          # nightly: full run + flaky hunt
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [demo, staging]
+        default: demo
+      tag:
+        description: 'Playwright --grep tag expression (e.g. @smoke, @api, @rbac)'
+        type: string
+        default: ''
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEST_ENV: ${{ inputs.environment || 'demo' }}
+  STAGING_URL: ${{ secrets.STAGING_URL }}
+  STAGING_ADMIN_USER: ${{ secrets.STAGING_ADMIN_USER }}
+  STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+
+  e2e:
+    name: e2e (shard ${{ matrix.shard }}/3)
+    needs: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]          # parallelisation across machines; workers parallelise within each
+    env:
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      - name: Run tests
+        run: npx playwright test --shard=${{ matrix.shard }}/3 ${{ inputs.tag && format('--grep "{0}"', inputs.tag) || '' }}
+      - name: Upload blob report (for merge)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-${{ matrix.shard }}
+          path: blob-report
+          retention-days: 7
+      - name: Upload failure evidence (screenshots, videos, traces)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-${{ matrix.shard }}
+          path: reports/test-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.shard }}
+          path: reports/junit.xml
+          if-no-files-found: ignore
+
+  merge-reports:
+    name: Merge HTML report
+    needs: e2e
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-blob-reports
+          pattern: blob-report-*
+          merge-multiple: true
+      - name: Merge into a single HTML + JSON report
+        env:
+          PLAYWRIGHT_HTML_REPORT: reports/html
+          PLAYWRIGHT_HTML_OPEN: never
+          PLAYWRIGHT_JSON_OUTPUT_NAME: reports/results.json
+        run: npx playwright merge-reports --reporter=html,json ./all-blob-reports
+      - name: Flaky test summary
+        run: node scripts/detect-flaky.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: html-report
+          path: |
+            reports/html
+            reports/results.json
+            reports/flaky-report.md
+          retention-days: 30
+
+  flaky-hunt:
+    name: Nightly flaky hunt
+    if: github.event_name == 'schedule'
+    needs: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: 'true'
+      FLAKY_HUNT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Repeat smoke tests with retries disabled
+        run: npx playwright test --grep @smoke --repeat-each=5 --workers=2
+        continue-on-error: true
+      - name: Detect flakiness
+        run: node scripts/detect-flaky.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flaky-hunt
+          path: |
+            reports/results.json
+            reports/flaky-report.md
+            reports/test-artifacts
+
+  performance:
+    name: k6 performance (bonus)
+    # Not on every PR: it hits a shared service. Run nightly or on demand.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grafana/setup-k6-action@v1
+      - run: mkdir -p reports/perf
+      - name: Login API
+        run: k6 run perf/k6/login.test.js
+      - name: Employee creation API
+        run: k6 run perf/k6/employee-create.test.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-reports
+          path: reports/perf
